@@ -402,6 +402,9 @@ def main(argv):
 		# 		download_version(args.mojang_versions, new_version, dest)
 	else:
 		print("Skipping update check.")
+		if not mcversion:
+			print("Could not read version from Index file. Please run the patch generator without --offline at least once.")
+			return 1
 
 	if not (new_version or args.force or args.offline):
 		print("No new version found, not doing anything.")
