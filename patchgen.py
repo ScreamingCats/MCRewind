@@ -25,19 +25,17 @@
 from __future__ import print_function, unicode_literals, absolute_import
 
 # IMPORTS
-import json
-import md5
-import re
-
-import urllib2
-import requests
-
-from urlparse import urljoin
-
-import argparse
 import os
 import sys
 import shutil
+import argparse
+import json
+import hashlib
+import contextlib
+
+import urllib2
+import httplib
+import urlparse
 
 from Queue import Queue
 from threading import Thread
@@ -51,17 +49,14 @@ import bsdiff4
 
 def determine_latest_version(mojang_versions_url):
 	"""Reads from Mojang's version list and returns the name of the latest version of Minecraft."""
-
-	response = urllib2.urlopen(urljoin(mojang_versions_url, "versions.json"))
-	json_str = response.read()
-
-	data = json.loads(json_str)
-
+	with contextlib.closing(urllib2.urlopen(urlparse.urljoin(mojang_versions_url, "versions.json"))) as fp:
+		data = json.load(fp)
 	return data["latest"]["release"]
 
 
+valid_md5 = "0123456789ABCDEFabcdef"
 def is_valid_md5(md5str):
-	return len(md5str) == 32 and re.findall(r"[a-fA-F\d]", md5str)
+	return len(md5str) == 32 and all(c in valid_md5 for c in md5str)
 
 
 def get_index_mcversion(index_path):
@@ -70,14 +65,10 @@ def get_index_mcversion(index_path):
 	return <index mcversion or None>
 	"""
 	if os.path.exists(index_path):
-		index = json.load(open(index_path, "r"))
+		with open(index_path, "r") as fp:
+			index = json.load(fp)
 		return index["mcversion"]
 	return None
-
-
-def download_version(mojang_versions_url, mcversion, dest, max_tries = 3):
-	"""Downloads the jar file with the given version number from Mojang's download site to the given output file."""
-	pass
 
 
 def generate_patch(version, old_jar, patch, latest_jar):
@@ -88,10 +79,19 @@ def generate_patch(version, old_jar, patch, latest_jar):
 
 	result = {"name": version}
 	with open(old_jar, "rb") as fp:
-		result["md5"] = md5.new(fp.read()).hexdigest()
+		result["md5"] = hashlib.md5(fp.read()).hexdigest()
 
 	return result
 
+
+def http_head(url):
+	""" send a HTTP HEAD request. return CODE, HEADERS """
+	parts = urlparse.urlparse(url)
+	with contextlib.closing(httplib.HTTPConnection(parts.netloc)) as connection:
+		connection.connect()
+		connection.request("HEAD", parts.path)
+		resp = connection.getresponse()
+		return resp.status, dict(resp.getheaders())
 
 
 #########
@@ -106,31 +106,31 @@ def check_new_jars(jar_dir_path, cache_file_path, mojang_versions_url, verbose =
 
 	Returns the version name of the new jar if there is one. Otherwise, return an empty string.
 	"""
-
 	# This is probably a monstrosity, but I don't want to have to type this crap out 20 times...
-	def print_new_version_reason(msg):
-		print("Assuming there's a new version because %s" % msg)
+	def verbose_new_version_reason(msg):
+		if verbose:
+			print("Assuming there's a new version because %s" % msg)
 
 	# First, get the version name of the latest minecraft.jar 
 	latest_version_name = determine_latest_version(mojang_versions_url)
 
 	# Next, we need to make sure the cache file exists. If it doesn't, assume there's a new version.
 	if not os.path.exists(cache_file_path):
-		if verbose: print_new_version_reason("the cache file doesn't exist.")
+		verbose_new_version_reason("the cache file doesn't exist.")
 		return latest_version_name
 
 	# Now we load the cache file.
-	cache_info = {}
-	with open(cache_file_path, "r") as cahce_file: cache_info = json.load(cahce_file) # TODO: Handle syntax errors
+	with open(cache_file_path, "r") as cache_file:
+		cache_info = json.load(cache_file) # TODO: Handle syntax errors
 
 	# Ensure the cache is valid.
 	if not "mcversion" in cache_info or not "md5sum" in cache_info:
-		if verbose: print_new_version_reason("the cache file is missing fields.")
+		verbose_new_version_reason("the cache file is missing fields.")
 		return latest_version_name
 
 	# Make sure the cache file's mcversion name matches the latest version name.
 	if cache_info["mcversion"] != latest_version_name:
-		if verbose: print_new_version_reason("the mcversion specified in the cache file doesn't match the latest version.")
+		verbose_new_version_reason("the mcversion specified in the cache file doesn't match the latest version.")
 		return latest_version_name
 
 	# Determine the path to the latest jar
@@ -138,35 +138,35 @@ def check_new_jars(jar_dir_path, cache_file_path, mojang_versions_url, verbose =
 
 	# Make sure we have a jar file in our jars folder matching this version name.
 	if not os.path.exists(latest_jar_path):
-		if verbose: print_new_version_reason("no jar file found matching the mcversion specified in the cache file.")
+		verbose_new_version_reason("no jar file found matching the mcversion specified in the cache file.")
 		return latest_version_name
 
-	# Get the ETag for the latest jar file.
-	req = requests.head(mojang_versions_url + "{0}/{0}.jar".format(latest_version_name))
-	req.raise_for_status()
-	etag = req.headers['ETag'][1:-1]
+	# Get the ETag for the latest jar file
+	_, headers = http_head(mojang_versions_url + "{0}/{0}.jar".format(latest_version_name))
+	etag = headers['etag'][1:-1]
 
 	# Make sure the ETag is a valid MD5sum. If not, error.
 	if not is_valid_md5(etag):
 		print("ETag %s is not a valid MD5sum. Aborting!" % etag)
-		if verbose: print_new_version_reason("the ETag received from the version list is not a valid MD5sum.")
-		return "" # TODO: Should return an error here.
+		verbose_new_version_reason("the ETag received from the version list is not a valid MD5sum.")
+		return None #TODO exception?
 
 	# Check if the ETag matches the MD5sum field in the cache file.
 	if etag != cache_info["md5sum"]:
-		if verbose: print_new_version_reason("the ETag on the version list (%s) doesn't match the one in the cache file (%s)." %
+		verbose_new_version_reason("the ETag on the version list (%s) doesn't match the one in the cache file (%s)." %
 											(etag, cache_info["md5sum"]))
 		return latest_version_name
 
 	# Next we calculate the MD5sum of the already downloaded file in our jars folder and make sure it matches too.
-	jar_md5 = md5.new()
-	with open(latest_jar_path, "rb") as jar: jar_md5.update(jar.read())
+	jar_md5 = hashlib.md5()
+	with open(latest_jar_path, "rb") as jar:
+		jar_md5.update(jar.read())
 	if etag != jar_md5.hexdigest():
-		if verbose: print_new_version_reason("the MD5sum of the jar file doesn't match the ETag or the one in the cache file.")
+		verbose_new_version_reason("the MD5sum of the jar file doesn't match the ETag or the one in the cache file.")
 		return latest_version_name
 
 	# Now that all of these checks have passed, we can be almost absolutely sure that the version we have in the jars folder is actually the version we want. Return empty string, indicating that we don't need to download anything.
-	return ""
+	return None
 
 
 def download_latest_jar(latest_version_name, cache_file_path, mojang_versions_url,
@@ -178,7 +178,6 @@ def download_latest_jar(latest_version_name, cache_file_path, mojang_versions_ur
 
 	returns < 0 if successful, otherwise positive number > 1
 	"""
-
 	try_count = 0
 	jar_md5 = None
 
@@ -186,48 +185,42 @@ def download_latest_jar(latest_version_name, cache_file_path, mojang_versions_ur
 	while try_count < max_tries:
 
 		# Open URL and file streams for reading / writing.
-		response = urllib2.urlopen(urljoin(mojang_versions_url, "{0}/{0}.jar".format(latest_version_name)))
-		outfile = open(dest, "wb")
+		with contextlib.closing(urllib2.urlopen(urlparse.urljoin(mojang_versions_url, "{0}/{0}.jar".format(latest_version_name)))) as response:
+			with open(dest, "wb") as outfile:
+				# Get header info.
+				info = response.info()
 
+				# Get the ETag field from the header.
+				etag = (info.getheaders("ETag")[0])[1:-1]
+				size = int(info.getheaders("Content-Length")[0])
+				print("Downloading %i bytes" % size)
 
-		# Get header info.
-		info = response.info()
+				# Ensure that the etag is a valid MD5
+				if not is_valid_md5(etag):
+					print("ETag %s is not a valid MD5. Aborting!" % etag)
+					return 1
 
-		# Get the ETag field from the header.
-		etag = (info.getheaders("ETag")[0])[1:-1]
-		size = int(info.getheaders("Content-Length")[0])
-		print("Downloading %i bytes" % size)
+				# Create a new MD5 object for the data we're downloading.
+				md5obj = hashlib.md5()
 
-		# Ensure that the etag is a valid MD5
-		if not is_valid_md5(etag):
-			print("ETag %s is not a valid MD5. Aborting!" % etag)
-			return 1
+				# Download data and pass it to the MD5 object as we download it.
+				downloaded = 0
+				block_sz = 8192
+				while True:
+					buf = response.read(block_sz)
+					if not buf:
+						break
 
+					downloaded += len(buf)
+					outfile.write(buf)
+					md5obj.update(buf)
 
-		# Create a new MD5 object for the data we're downloading.
-		md5obj = md5.new()
+					# Show a progress indicator if it's enabled.
+					if show_progress_indicator:
+						pcnt = int((float(downloaded) / float(size)) * 100)
+						print("\rDownloading jar file - %3d%% [%7d/%7d bytes]" % (pcnt, downloaded, size), end="")
 
-		# Download data and pass it to the MD5 object as we download it.
-		downloaded = 0
-		block_sz = 8192
-		while True:
-			buf = response.read(block_sz)
-			if not buf:
-				break
-
-			downloaded += len(buf)
-			outfile.write(buf)
-			md5obj.update(buf)
-
-			# Show a progress indicator if it's enabled.
-			if show_progress_indicator:
-				pcnt = int((float(downloaded) / float(size)) * 100)
-				print("\rDownloading jar file - %3d%% [%7d/%7d bytes]" % (pcnt, downloaded, size), end="")
-
-		sys.stdout.write("\n")
-		sys.stdout.flush()
-
-		outfile.close()
+				print()
 
 		jar_md5 = md5obj.hexdigest()
 		if jar_md5 == etag:
@@ -244,12 +237,10 @@ def download_latest_jar(latest_version_name, cache_file_path, mojang_versions_ur
 			print("MD5 of downloaded data (%s) did not match the ETag (%s). Giving up after %d tries." % (digest, etag, try_count))
 			return 1
 
-
 	# Now that we've downloaded the file, we need to store the information in the cache file.
 	# Luckily, Python is fucking awesome.
 	with open(cache_file_path, "w") as cache_file:
 		json.dump({ "mcversion": latest_version_name, "md5sum": jar_md5 }, cache_file)
-
 
 	return 0
 
@@ -262,7 +253,6 @@ def generate_patches(worker_threads, jar_dir_path, output_dir_path, index_file_n
 	latest_mc_version specifies the version name of the latest Minecraft version.
 	returns < 0 if successful, otherwise positive number > 1
 	"""
-
 	if not os.path.exists(jar_dir_path):
 		print("No jars directory found at %s" % jar_dir_path)
 		return 2
@@ -290,8 +280,6 @@ def generate_patches(worker_threads, jar_dir_path, output_dir_path, index_file_n
 		
 		patch_queue.put(os.path.join(jar_dir_path, jarfile))
 
-
-
 	# Thread function for patch generation workers.
 	def patchgen_worker():
 		while not patch_queue.empty():
@@ -303,7 +291,6 @@ def generate_patches(worker_threads, jar_dir_path, output_dir_path, index_file_n
 				os.path.join(output_dir_path, "%s.patch" % fname), latest_jar_path))
 
 			patch_queue.task_done()
-
 
 	for i in range(worker_threads):
 		t = Thread(target = patchgen_worker)
@@ -356,7 +343,6 @@ def main(argv):
 	args = parser.parse_args(argv[1:])
 
 
-
 	print("MCRewind Patch Generator v1")
 
 	print("Force generate patches? %s" % str(args.force))
@@ -368,7 +354,7 @@ def main(argv):
 	print("Output directory: %s" % args.output_dir)
 	print("Index file path: %s" % args.index_file)
 	print("Cache file path: %s" % args.cache_file)
-	print("")
+	print()
 
 	mcversion = get_index_mcversion(args.index_file)
 
@@ -402,6 +388,9 @@ def main(argv):
 		# 		download_version(args.mojang_versions, new_version, dest)
 	else:
 		print("Skipping update check.")
+		if not mcversion:
+			print("Could not read version from Index file. Please run the patch generator without --offline at least once.")
+			return 1
 
 	if not (new_version or args.force or args.offline):
 		print("No new version found, not doing anything.")
